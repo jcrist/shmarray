@@ -20,7 +20,7 @@ typedef struct {
     PyObject_HEAD
     char *data;
     char *name;
-    size_t size;
+    size_t nbytes;
     int exports;
     mode_enum mode;
     PyObject *weakreflist;
@@ -29,15 +29,15 @@ typedef struct {
 
 typedef struct {
     atomic_uint refcount;
-    size_t size;
+    size_t nbytes;
 } shmbuffer_header;
 
 
 static void
-shmbuffer_init(char *buffer, size_t size) {
+shmbuffer_init(char *buffer, size_t nbytes) {
     shmbuffer_header *header = (shmbuffer_header *)buffer;
     header->refcount = ATOMIC_VAR_INIT(1);
-    header->size = size;
+    header->nbytes = nbytes;
 }
 
 
@@ -63,9 +63,9 @@ shmbuffer_getref(char *buffer) {
 
 
 static size_t
-shmbuffer_getsize(char *buffer) {
+shmbuffer_get_nbytes(char *buffer) {
     shmbuffer_header *header = (shmbuffer_header *)buffer;
-    return header->size;
+    return header->nbytes;
 }
 
 
@@ -76,7 +76,7 @@ shmbuffer_object_dealloc(shmbuffer_object *self)
         if (!shmbuffer_decref(self->data)) {
             shm_unlink(self->name);
         }
-        munmap(self->data, self->size);
+        munmap(self->data, self->nbytes + sizeof(shmbuffer_header));
     }
 
     if (self->weakreflist != NULL)
@@ -102,7 +102,7 @@ shmbuffer_close_method(shmbuffer_object *self, PyObject *unused)
         if (!shmbuffer_decref(self->data)) {
             shm_unlink(self->name);
         }
-        munmap(self->data, self->size);
+        munmap(self->data, self->nbytes + sizeof(shmbuffer_header));
         self->data = NULL;
     }
 
@@ -126,6 +126,7 @@ shmbuffer_closed_get(shmbuffer_object *self)
     return PyBool_FromLong(self->data == NULL ? 1 : 0);
 }
 
+
 static PyObject *
 shmbuffer_refcount_get(shmbuffer_object *self)
 {
@@ -133,22 +134,25 @@ shmbuffer_refcount_get(shmbuffer_object *self)
     return PyLong_FromUnsignedLong(shmbuffer_getref(self->data));
 }
 
+
 static PyObject *
-shmbuffer_size_get(shmbuffer_object *self)
+shmbuffer_nbytes_get(shmbuffer_object *self)
 {
     CHECK_VALID(NULL);
-    return PyLong_FromSize_t(self->size);
+    return PyLong_FromSize_t(self->nbytes);
 }
+
 
 static struct PyMethodDef shmbuffer_object_methods[] = {
     {"close",     (PyCFunction) shmbuffer_close_method,   METH_NOARGS},
     {NULL, NULL}  /* sentinel */
 };
 
+
 static PyGetSetDef shmbuffer_object_getset[] = {
     {"closed", (getter) shmbuffer_closed_get, NULL, NULL},
     {"refcount", (getter) shmbuffer_refcount_get, NULL, NULL},
-    {"size", (getter) shmbuffer_size_get, NULL, NULL},
+    {"nbytes", (getter) shmbuffer_nbytes_get, NULL, NULL},
     {NULL}  /* sentinel */
 };
 
@@ -159,7 +163,7 @@ shmbuffer_buffer_getbuf(shmbuffer_object *self, Py_buffer *view, int flags)
     CHECK_VALID(-1);
     if (PyBuffer_FillInfo(view, (PyObject*)self,
                           self->data + sizeof(shmbuffer_header),
-                          self->size - sizeof(shmbuffer_header),
+                          self->nbytes,
                           (self->mode == MODE_READ), flags) < 0)
         return -1;
     self->exports++;
@@ -180,19 +184,49 @@ static PyBufferProcs shmbuffer_as_buffer = {
 };
 
 
+static Py_ssize_t
+_get_nbytes(PyObject *o)
+{
+    if (o == NULL)
+        return 0;
+
+    if (!PyIndex_Check(o)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "shared memory nbytes must be an integral value");
+        return -1;
+    }
+
+    Py_ssize_t i = PyNumber_AsSsize_t(o, PyExc_OverflowError);
+    if (i==-1 && PyErr_Occurred())
+        return -1;
+
+    if (i <= 0) {
+        PyErr_SetString(PyExc_ValueError,
+                        "shared memory nbytes must be positive");
+        return -1;
+    }
+    return i;
+}
+
+
 static PyObject *
 new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
 {
     shmbuffer_object *self;
     char *nametemp = NULL, *name = NULL, *mode_str = "x+", *map_addr = NULL;
-    Py_ssize_t map_size;
+    Py_ssize_t nbytes, map_size;
+    PyObject *nbytes_obj = NULL;
     int fd, flags, prot, mode;
-    int resize;
 
     static char *keywords[] = {"name", "nbytes", "mode", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwdict, "sn|s", keywords,
-                                     &nametemp, &map_size, &mode_str))
+    if (!PyArg_ParseTupleAndKeywords(args, kwdict, "s|Os", keywords,
+                                     &nametemp, &nbytes_obj, &mode_str))
+        return NULL;
+
+    /* Determine nbytes*/
+    nbytes = _get_nbytes(nbytes_obj);
+    if (nbytes < 0)
         return NULL;
 
     /* Copy the tagname over */
@@ -208,23 +242,33 @@ new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
         mode = MODE_READ;
         prot = PROT_READ;
         flags = O_RDONLY;
-        resize = 0;
     }
     else if (strcmp(mode_str, "r+") == 0) {
         mode = MODE_READPLUS;
         prot = PROT_READ | PROT_WRITE;
         flags = O_RDWR;
-        resize = 0;
     }
     else if (strcmp(mode_str, "x+") == 0) {
         mode = MODE_CREATE;
         prot = PROT_READ | PROT_WRITE;
         flags = O_RDWR | O_CREAT | O_EXCL;
-        resize = 1;
     }
     else {
+        PyErr_SetString(PyExc_ValueError,
+                        "shmbuffer invalid mode parameter.");
+        return NULL;
+    }
+
+    /* Validate mode and nbytes agree */
+    if (mode == MODE_CREATE && nbytes == 0) {
+        PyErr_SetString(PyExc_ValueError,
+                        "shmbuffer with mode='x+' requires "
+                        "specified nbytes.");
+        return NULL;
+    } else if (mode != MODE_CREATE && nbytes != 0) {
         return PyErr_Format(PyExc_ValueError,
-                            "shmbuffer invalid mode parameter.");
+                            "shmbuffer cannot use 'nbytes' parameter with "
+                            "mode='%s'", mode);
     }
 
     /* Open the file descriptor */
@@ -232,16 +276,25 @@ new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
     if (fd < 0)
         return PyErr_SetFromErrnoWithFilename(PyExc_OSError, name);
 
-    /* Include the header in the size */
-    map_size += sizeof(shmbuffer_header);
-
-    /* Grow the file if needed */
-    if (resize) {
+    if (mode == MODE_CREATE) {
+        map_size = nbytes + sizeof(shmbuffer_header);
         if (ftruncate(fd, map_size) < 0) {
             close(fd);
             shm_unlink(name);
             return PyErr_SetFromErrnoWithFilename(PyExc_OSError, name);
         }
+    } else {
+        /* Initial mmap to find nbytes */
+        map_addr = mmap(NULL, sizeof(shmbuffer_header),
+                        prot, MAP_SHARED, fd, 0);
+        if (map_addr == MAP_FAILED) {
+            close(fd);
+            shm_unlink(name);
+            return PyErr_SetFromErrnoWithFilename(PyExc_OSError, name);
+        }
+        nbytes = shmbuffer_get_nbytes(map_addr);
+        map_size = nbytes + sizeof(shmbuffer_header);
+        munmap(map_addr, sizeof(shmbuffer_header));
     }
 
     /* Map it */
@@ -253,12 +306,10 @@ new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
     }
 
     /* Initialize if needed */
-    if (resize) {
-        shmbuffer_init(map_addr, map_size);
-    }
-    else {
+    if (mode == MODE_CREATE)
+        shmbuffer_init(map_addr, nbytes);
+    else
         shmbuffer_incref(map_addr);
-    }
     close(fd);
 
     self = (shmbuffer_object *)type->tp_alloc(type, 0);
@@ -270,7 +321,7 @@ new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
     }
 
     self->name = name;
-    self->size = (size_t) map_size;
+    self->nbytes = (size_t) nbytes;
     self->weakreflist = NULL;
     self->exports = 0;
     self->data = map_addr;

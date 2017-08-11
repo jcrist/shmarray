@@ -77,9 +77,8 @@ class shmbuffer(mmap.mmap):
         except Exception:
             unlink(name)
             raise
-        finally:
-            os.close(fd)
 
+        obj.fd = fd
         obj.name = name
         obj.nbytes = nbytes
         obj.mode = mode
