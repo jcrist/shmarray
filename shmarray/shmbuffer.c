@@ -187,7 +187,7 @@ static PyBufferProcs shmbuffer_as_buffer = {
 static Py_ssize_t
 _get_nbytes(PyObject *o)
 {
-    if (o == NULL)
+    if (o == NULL || o == Py_None)
         return 0;
 
     if (!PyIndex_Check(o)) {
@@ -213,7 +213,7 @@ static PyObject *
 new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
 {
     shmbuffer_object *self;
-    char *nametemp = NULL, *name = NULL, *mode_str = "x+", *map_addr = NULL;
+    char *nametemp = NULL, *name = NULL, *mode_str = "r+", *map_addr = NULL;
     Py_ssize_t nbytes, map_size;
     PyObject *nbytes_obj = NULL;
     int fd, flags, prot, mode;
@@ -330,7 +330,8 @@ new_shmbuffer_object(PyTypeObject *type, PyObject *args, PyObject *kwdict)
     return (PyObject *)self;
 }
 
-PyDoc_STRVAR(shmbuffer_doc, "shmbuffer(name, nbytes, mode='x+'");
+
+PyDoc_STRVAR(shmbuffer_doc, "shmbuffer(name, nbytes=None, mode='r+'");
 
 
 static PyTypeObject shmbuffer_object_type = {
