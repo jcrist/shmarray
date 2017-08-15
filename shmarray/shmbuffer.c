@@ -33,6 +33,19 @@ typedef struct {
 } shmbuffer_header;
 
 
+static PyObject*
+shmbuffer_unlink(PyObject *self, PyObject *args) {
+    char *name = "";
+    if (!PyArg_ParseTuple(args, "s", &name))
+        return NULL;
+    if (shm_unlink(name) < 0)
+        return PyErr_SetFromErrnoWithFilename(PyExc_OSError, name);
+
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
+
 static void
 shmbuffer_init(char *buffer, size_t nbytes) {
     shmbuffer_header *header = (shmbuffer_header *)buffer;
@@ -143,6 +156,13 @@ shmbuffer_nbytes_get(shmbuffer_object *self)
 }
 
 
+static PyObject *
+shmbuffer_name_get(shmbuffer_object *self)
+{
+    return PyUnicode_FromString(self->name);
+}
+
+
 static struct PyMethodDef shmbuffer_object_methods[] = {
     {"close",     (PyCFunction) shmbuffer_close_method,   METH_NOARGS},
     {NULL, NULL}  /* sentinel */
@@ -153,6 +173,7 @@ static PyGetSetDef shmbuffer_object_getset[] = {
     {"closed", (getter) shmbuffer_closed_get, NULL, NULL},
     {"refcount", (getter) shmbuffer_refcount_get, NULL, NULL},
     {"nbytes", (getter) shmbuffer_nbytes_get, NULL, NULL},
+    {"name", (getter) shmbuffer_name_get, NULL, NULL},
     {NULL}  /* sentinel */
 };
 
@@ -376,13 +397,19 @@ static PyTypeObject shmbuffer_object_type = {
     PyObject_Del,                               /* tp_free */
 };
 
+static PyMethodDef shmbuffer_methods[] = {
+    {"unlink", shmbuffer_unlink, METH_VARARGS,
+     "Unlink a shared memory segment"},
+    {NULL, NULL, 0, NULL}        /* Sentinel */
+};
+
 
 static struct PyModuleDef shmbuffermodule = {
     PyModuleDef_HEAD_INIT,
     "shmbuffer",
     NULL,
     -1,
-    NULL,
+    shmbuffer_methods,
     NULL,
     NULL,
     NULL,
